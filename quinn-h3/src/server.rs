@@ -85,22 +85,19 @@ impl Builder {
     pub fn endpoint(
         self,
         endpoint: EndpointBuilder,
-    ) -> Result<(Server, IncomingConnection), quinn::EndpointError> {
+    ) -> Result<IncomingConnection, quinn::EndpointError> {
         let listen = self
             .listen
             .unwrap_or_else(|| "[::]:4433".parse().expect("valid listen address"));
         let (_, incoming) = endpoint.bind(&listen)?;
 
-        Ok((
-            Server,
-            IncomingConnection {
-                incoming,
-                settings: self.settings,
-            },
-        ))
+        Ok(IncomingConnection {
+            incoming,
+            settings: self.settings,
+        })
     }
 
-    pub fn build(self) -> Result<(Server, IncomingConnection), quinn::EndpointError> {
+    pub fn build(self) -> Result<IncomingConnection, quinn::EndpointError> {
         let mut endpoint_builder = quinn::Endpoint::builder();
         endpoint_builder.listen(self.config.build());
 
@@ -109,17 +106,12 @@ impl Builder {
             .unwrap_or_else(|| "[::]:4433".parse().expect("valid listen address"));
         let (_, incoming) = endpoint_builder.bind(&listen)?;
 
-        Ok((
-            Server,
-            IncomingConnection {
-                incoming,
-                settings: self.settings,
-            },
-        ))
+        Ok(IncomingConnection {
+            incoming,
+            settings: self.settings,
+        })
     }
 }
-
-pub struct Server;
 
 pub struct IncomingConnection {
     incoming: quinn::Incoming,
