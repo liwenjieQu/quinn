@@ -88,7 +88,7 @@ impl Builder {
     ) -> Result<(Server, IncomingConnection), quinn::EndpointError> {
         let listen = self
             .listen
-            .unwrap_or_else(|| "[::]:4433".parse().expect("valid listen address"));
+            .unwrap_or_else(|| "[::]:0".parse().expect("valid listen address"));
         let (_, incoming) = endpoint.bind(&listen)?;
 
         Ok((
@@ -106,7 +106,7 @@ impl Builder {
 
         let listen = self
             .listen
-            .unwrap_or_else(|| "[::]:4433".parse().expect("valid listen address"));
+            .unwrap_or_else(|| "[::]:0".parse().expect("valid listen address"));
         let (_, incoming) = endpoint_builder.bind(&listen)?;
 
         Ok((
