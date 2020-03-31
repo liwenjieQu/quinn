@@ -49,13 +49,28 @@ impl Default for Builder {
 }
 
 impl Builder {
-    pub fn with_quic_config(mut config: quinn::ServerConfigBuilder) -> Self {
-        config.protocols(&[crate::ALPN]);
-        Self {
-            config,
-            listen: None,
-            settings: Settings::new(),
-        }
+    pub fn certificate(
+        &mut self,
+        cert_chain: CertificateChain,
+        key: PrivateKey,
+    ) -> Result<&mut Self, TLSError> {
+        self.config.certificate(cert_chain, key)?;
+        Ok(self)
+    }
+
+    pub fn build(self) -> Result<IncomingConnection, quinn::EndpointError> {
+        let mut endpoint_builder = quinn::Endpoint::builder();
+        endpoint_builder.listen(self.config.build());
+
+        let listen = self
+            .listen
+            .unwrap_or_else(|| "[::]:4433".parse().expect("valid listen address"));
+        let (_, incoming) = endpoint_builder.bind(&listen)?;
+
+        Ok(IncomingConnection {
+            incoming,
+            settings: self.settings,
+        })
     }
 
     pub fn listen<S: ToSocketAddrs>(&mut self, socket: S) -> Result<&mut Self, io::Error> {
@@ -68,20 +83,19 @@ impl Builder {
         Ok(self)
     }
 
-    pub fn certificate(
-        &mut self,
-        cert_chain: CertificateChain,
-        key: PrivateKey,
-    ) -> Result<&mut Self, TLSError> {
-        self.config.certificate(cert_chain, key)?;
-        Ok(self)
-    }
-
     pub fn settings(&mut self, settings: Settings) -> &mut Self {
         self.settings = settings;
         self
     }
 
+    pub fn with_quic_config(mut config: quinn::ServerConfigBuilder) -> Self {
+        config.protocols(&[crate::ALPN]);
+        Self {
+            config,
+            listen: None,
+            settings: Settings::new(),
+        }
+    }
     pub fn endpoint(
         self,
         endpoint: EndpointBuilder,
@@ -90,21 +104,6 @@ impl Builder {
             .listen
             .unwrap_or_else(|| "[::]:4433".parse().expect("valid listen address"));
         let (_, incoming) = endpoint.bind(&listen)?;
-
-        Ok(IncomingConnection {
-            incoming,
-            settings: self.settings,
-        })
-    }
-
-    pub fn build(self) -> Result<IncomingConnection, quinn::EndpointError> {
-        let mut endpoint_builder = quinn::Endpoint::builder();
-        endpoint_builder.listen(self.config.build());
-
-        let listen = self
-            .listen
-            .unwrap_or_else(|| "[::]:4433".parse().expect("valid listen address"));
-        let (_, incoming) = endpoint_builder.bind(&listen)?;
 
         Ok(IncomingConnection {
             incoming,
@@ -159,6 +158,12 @@ impl Connecting {
         tokio::spawn(ConnectionDriver(conn_ref.clone()));
         Ok((IncomingRequest(conn_ref), zerortt_accepted))
     }
+    pub fn from_quic(connecting: quinn::Connecting, settings: Settings) -> Self {
+        Self {
+            connecting,
+            settings,
+        }
+    }
 }
 
 impl Future for Connecting {
@@ -192,15 +197,6 @@ impl From<quinn::Connecting> for Connecting {
     }
 }
 
-impl Connecting {
-    pub fn from_quic(connecting: quinn::Connecting, settings: Settings) -> Self {
-        Self {
-            connecting,
-            settings,
-        }
-    }
-}
-
 pub struct IncomingRequest(ConnectionRef);
 
 impl IncomingRequest {
@@ -221,12 +217,6 @@ impl Stream for IncomingRequest {
     }
 }
 
-enum RecvRequestState {
-    Receiving(FrameStream, SendStream),
-    Decoding(DecodeHeaders),
-    Finished,
-}
-
 pub struct RecvRequest {
     state: RecvRequestState,
     conn: ConnectionRef,
@@ -235,7 +225,21 @@ pub struct RecvRequest {
     is_0rtt: bool,
 }
 
+enum RecvRequestState {
+    Receiving(FrameStream, SendStream),
+    Decoding(DecodeHeaders),
+    Finished,
+}
+
 impl RecvRequest {
+    pub fn reject(mut self) {
+        let state = mem::replace(&mut self.state, RecvRequestState::Finished);
+        if let RecvRequestState::Receiving(recv, mut send) = state {
+            recv.reset(ErrorCode::REQUEST_REJECTED);
+            send.reset(ErrorCode::REQUEST_REJECTED.into());
+        }
+    }
+
     fn new(recv: RecvStream, send: SendStream, conn: ConnectionRef) -> Self {
         Self {
             conn,
@@ -264,14 +268,6 @@ impl RecvRequest {
 
         *request.headers_mut() = headers;
         Ok(request)
-    }
-
-    pub fn reject(mut self) {
-        let state = mem::replace(&mut self.state, RecvRequestState::Finished);
-        if let RecvRequestState::Receiving(recv, mut send) = state {
-            recv.reset(ErrorCode::REQUEST_REJECTED);
-            send.reset(ErrorCode::REQUEST_REJECTED.into());
-        }
     }
 }
 
