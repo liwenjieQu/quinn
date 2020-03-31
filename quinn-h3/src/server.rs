@@ -1,3 +1,110 @@
+//! Server implementation for the HTTP/3 protocol.
+//!
+//! # Overview
+//!
+//! Simply build a new server endpoint with [`Builder::default()`], the only required configuration
+//! is the [`certificate`]. Calling [`Builder::build()`] will bind a `UDP` socket listening on
+//! `0.0.0.0:4433` and return a [`Stream`] of [`IncomingConnection`]s.
+//!
+//! Each of which will need to complete handshaking, waiting for [`Connecting`] to resolve. At this time,
+//! you can also try to execute requests arrived before the handshake completion, by using the
+//! [`Connecting::into_0rtt()`] method. At a certain security cost, see method's documentation.
+//!
+//! A connection is essentially a [`Stream`] of [`IncomingRequest`]s. Polling it will yeild futures
+//! representing the header reception: [`RecvRequest`] will resolve into the request's header values,
+//! along with [`BodyReader`] and [`Sender`] to manage the rest of this request processing.
+//! Respectively for receiving the body and it's trailer, if any, and sending a response back.
+//!
+//! Similarily with request, the response body will be available for writing once the headers
+//! are sent with [`Sender::send_response()`]. [`BodyWriter`] implements [`AsyncWrite`] for
+//! that pupose. Trailers can optionally be appended then. Note the body can also be passed
+//! directly to [`http::Response<B>`], where `B` is convertible from some simple [`types`].
+//!
+//! # Example: simple server
+//!
+//! ```
+//! use std::fs;
+//! use futures::{StreamExt, AsyncWriteExt};
+//! use http::{Response, StatusCode};
+//! use quinn::{Certificate, CertificateChain, PrivateKey};
+//! use quinn_h3::{server, Settings};
+//!
+//! #[tokio::main]
+//! async fn main() {
+//! # return;
+//!     // The server always needs a certificate, as QUIC is secure by default.
+//!     let key_data = fs::read("key.der").unwrap();
+//!     let cert_data = fs::read("cert.der").unwrap();
+//!     let key = PrivateKey::from_der(&key_data).unwrap();
+//!     let cert = Certificate::from_der(&cert_data).unwrap();
+//!     let cert_chain = CertificateChain::from_certs(vec![cert]);
+//!
+//!     let mut incoming_connection = server::Builder::default()
+//!         .certificate(cert_chain, key)
+//!         .unwrap()
+//!         .build()
+//!         .unwrap();
+//!
+//!     while let Some(connecting) = incoming_connection.next().await {
+//!         // Handle each incoming connection in a new task.
+//!         tokio::spawn(async move {
+//!             // Complete QUIC handshake
+//!             let mut incoming_request = connecting.await.unwrap();
+//!
+//!             while let Some(recv_request) = incoming_request.next().await {
+//!                 // Each request also gets its own task
+//!                 tokio::spawn(async move {
+//!                     // Receive request
+//!                     let (request, _recv_body, mut sender) = recv_request.await.unwrap();
+//!                     println!("received request: {:?}", request);
+//!
+//!                     let response = Response::builder()
+//!                         .status(StatusCode::OK)
+//!                         .body("Greetings over datagram ways")
+//!                         .unwrap();
+//!
+//!                     // Send the response
+//!                     sender.send_response(response).await.unwrap();
+//!                 });
+//!             }
+//!         });
+//!     }
+//! }
+//! ```
+//!
+//! # Generate a certificate
+//!
+//! The `h3_server` example generates certificates for you:
+//!
+//! ```bash
+//! ❯ cargo run --example h3_server
+//!     Finished dev [unoptimized + debuginfo] target(s) in 0.09s
+//!      Running `target/debug/examples/h3_server`
+//! server listening
+//! ^C
+//! ❯ ls ~/.local/share/quinn-examples
+//! cert.der    key.der
+//! ```
+//!
+//! [`Builder::default()`]: struct.Builder.html#method.default
+//! [`Builder::build()`]: struct.Builder.html#method.build
+//! [`certificate`]: struct.Builder.html#method.certificate
+//! [`Stream`]: https://docs.rs/futures/*/futures/stream/trait.Stream.html
+//! [`IncomingConnection`]: struct.IncomingConnection.html
+//! [`Connecting`]: struct.Connecting.html
+//! [`Connecting::into_0rtt()`]: struct.Connecting.html#method.into_0rtt
+//! [`IncomingRequest`]: struct.IncomingRequest.html
+//! [`RecvRequest`]: struct.RecvRequest.html
+//! [`BodyReader`]: ../struct.BodyReader.html
+//! [`BodyWriter`]: ../struct.BodyWriter.html
+//! [`Sender`]: struct.Sender.html
+//! [`Sender::send_response()`]: struct.Sender.html#method.send_response
+//! [`AsyncWrite`]: https://docs.rs/futures/*/futures/io/trait.AsyncWrite.html
+//! [`http::Response<B>`]: https://docs.rs/http/*/http/response/index.html
+//! [`types`]: ../enum.Body.html
+
+#![allow(clippy::needless_doctest_main)]
+
 use std::{
     future::Future,
     io, mem,
@@ -28,6 +135,7 @@ use crate::{
     try_take, Error, Settings,
 };
 
+/// Configure and build a HTTP/3.0 server.
 #[derive(Clone)]
 pub struct Builder {
     config: quinn::ServerConfigBuilder,
@@ -49,6 +157,7 @@ impl Default for Builder {
 }
 
 impl Builder {
+    /// Set the certificate chain that will be presented to clients.
     pub fn certificate(
         &mut self,
         cert_chain: CertificateChain,
@@ -58,6 +167,9 @@ impl Builder {
         Ok(self)
     }
 
+    /// Create a new server with current configuration.
+    ///
+    /// Must be called from within a tokio runtime context.
     pub fn build(self) -> Result<IncomingConnection, quinn::EndpointError> {
         let mut endpoint_builder = quinn::Endpoint::builder();
         endpoint_builder.listen(self.config.build());
@@ -73,6 +185,14 @@ impl Builder {
         })
     }
 
+    /// Set the address the server will be bound to.
+    ///
+    /// ```
+    /// # use quinn_h3::server;
+    /// let mut builder = server::Builder::default();
+    /// builder.listen("example.com:4433")?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn listen<S: ToSocketAddrs>(&mut self, socket: S) -> Result<&mut Self, io::Error> {
         self.listen = Some(
             socket
@@ -83,11 +203,25 @@ impl Builder {
         Ok(self)
     }
 
+    /// Set H3 settings.
     pub fn settings(&mut self, settings: Settings) -> &mut Self {
         self.settings = settings;
         self
     }
 
+    /// Specify a base Quic configuration.
+    ///
+    /// Usefull for fine-tuning Quic settings like flow-control, cryptography... See
+    /// [`ServerConfigBuilder`] for the list of configurable settings.
+    ///
+    /// The ALPN will be overritten with [`quinn-h3's ALPN`](../constant.ALPN.html).
+    /// If you want to set your own configuration, use [`Builder::endpoint()`] with a
+    /// manually built endpoint.
+    ///
+    /// [`ServerConfigBuilder`]: ../../quinn/generic/struct.ServerConfigBuilder.html
+    /// [`ServerConfig`]: /quinn/struct.ServerConfig.html
+    /// [`quinn-h3's ALPN`]: ../constant.ALPN.html
+    /// [`Builder::endpoint()`]: #method.endpoint
     pub fn with_quic_config(mut config: quinn::ServerConfigBuilder) -> Self {
         config.protocols(&[crate::ALPN]);
         Self {
@@ -96,6 +230,17 @@ impl Builder {
             settings: Settings::new(),
         }
     }
+
+    /// Create a new server from an existing Quic endpoint configuration.
+    ///
+    /// Take full control over the underlying Quic configuration. This is notably
+    /// useful for supporting several protocols, or setting a custom crypto
+    /// configuration.
+    ///
+    /// If [listen()](struct.Builder.html#method.listen) has never been called,
+    /// the binding address defaults to `[::]:4433`.
+    ///
+    /// Must be called from within a tokio runtime context.
     pub fn endpoint(
         self,
         endpoint: EndpointBuilder,
@@ -112,6 +257,35 @@ impl Builder {
     }
 }
 
+/// Stream of incoming connection for one server endpoint.
+///
+/// Yeilds a new HTTP/3 connection as soon as the handshake starts. The returned [`Connecting`]
+/// object can then be used for waiting the handshake completion or can possibly be converted
+/// into a [`0-RTT`], enabling any hypothetic request conveyed in the first packet to be processed.
+///
+/// ```
+/// use futures::StreamExt;
+/// use quinn_h3::server;
+///
+/// # use anyhow::Result;
+/// # async fn handle_connection(conn: quinn_h3::server::Connecting) -> Result<()>
+/// # { unimplemented!() }
+/// # #[tokio::main]
+/// # async fn main() -> Result<()> {
+/// # return Ok(());
+/// let mut incoming_connection = server::Builder::default().build()?;
+///
+/// println!("server listening");
+/// while let Some(connecting) = incoming_connection.next().await {
+///     println!("server received connection");
+///     handle_connection(connecting);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`Connecting`]: struct.Connecting.html
+/// [`0-RTT`]: struct.Connecting.html#method.into_0rtt
 pub struct IncomingConnection {
     incoming: quinn::Incoming,
     settings: Settings,
@@ -130,12 +304,71 @@ impl Stream for IncomingConnection {
     }
 }
 
+/// HTTP/3 handshake future.
+///
+/// Represents an ongoing HTTP/3 handshake. Upon success, this future will resolve to a
+/// stream of [`IncomingRequest`]s.
+///
+/// [`IncomingRequest`]: struct.IncomingRequest.html
 pub struct Connecting {
     connecting: quinn::Connecting,
     settings: Settings,
 }
 
 impl Connecting {
+    /// Try to convert an ongoing handshake into a 0-RTT enabled exchange.
+    ///
+    /// # About 0-RTT
+    ///
+    /// 0 Round Trip Time is a QUIC feature enabling application data exchange before the
+    /// peers have finished the TLS handshake. It's based on prior crypto exchange, reused
+    /// for a new connection. So this function will fail if it's the first contact with
+    /// the client.
+    ///
+    /// # Security concerns
+    ///
+    /// This functionnality comes with limited security enforcement! It is vulnerable to
+    /// replay attacks. Therefore any non-idempotent method will make the connection be
+    /// rejected immediately. Applications shall also be careful about the load generated
+    /// by a 0-RTT triggered request processing, as this feature creates Denial Of Service
+    /// attack opportunities.
+    ///
+    /// # Usage
+    ///
+    /// Upon success, this method returns a stream of [`IncomingRequest`]s, and a future
+    /// that will resolve when the handshake completes: [`ZeroRttAccepted`]. If this peer
+    /// isn't associated with any known prior connection, the [`Connecting`] handshake
+    /// completion future will be handed back.
+    ///
+    /// ```
+    /// use futures::StreamExt;
+    /// use quinn_h3::server::{self, IncomingRequest};
+    ///
+    /// # use anyhow::Result;
+    /// # async fn handle_request(_: IncomingRequest) {unimplemented!()}
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// # return Ok(());
+    /// let mut incoming_connection = server::Builder::default().build()?;
+    ///
+    /// while let Some(connecting) = incoming_connection.next().await {
+    ///     match connecting.into_0rtt() {
+    ///         Ok((incoming_request, _zerortt_accepted)) => {
+    ///             handle_request(incoming_request).await;
+    ///         }
+    ///         Err(connecting) => {
+    ///             let incoming_request = connecting.await?;
+    ///             handle_request(incoming_request).await;
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`IncomingRequest`]: struct.IncomingRequest.html
+    /// [`ZeroRttAccepted`]: type.ZeroRttAccepted.html
+    /// [`Connecting`]: struct.Connecting.html
     pub fn into_0rtt(self) -> Result<(IncomingRequest, ZeroRttAccepted), Self> {
         let Self {
             connecting,
@@ -158,6 +391,61 @@ impl Connecting {
         tokio::spawn(ConnectionDriver(conn_ref.clone()));
         Ok((IncomingRequest(conn_ref), zerortt_accepted))
     }
+
+    /// Construct an HTTP/3 handsake future from an ongoing QUIC handshake.
+    ///
+    /// Makes supporting several protocols over one endpoint possible, by accepting
+    /// incoming connections initialization at the QUIC level. Client's ALPN can
+    /// then be used to route this new connection to the requested protocol. Say if
+    /// the ALPN matches [`quinn_h3::ALPN`], you can safely use [`Connecting::from_quic()`],
+    /// to handle this connection.
+    ///
+    /// Note [`From<quinn::Connecting>`] is also available if default settings suit
+    /// your needs.
+    ///
+    /// # Example: support multiple protocols over quic
+    /// ```
+    /// # use quinn;
+    /// # async fn serve_h3(conn: quinn_h3::server::Connecting) { unimplemented!() }
+    /// # async fn serve_tea(conn: quinn::Connecting) { unimplemented!() }
+    /// # fn main() {
+    /// # return ();
+    /// # use quinn_h3::{server, Settings};
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// use std::net::ToSocketAddrs;
+    /// use futures::StreamExt;
+    ///
+    /// use quinn;
+    /// use quinn_h3::server;
+    ///
+    /// let mut server_config = quinn::ServerConfigBuilder::default();
+    /// // server_config.certificate(cert_chain, key)
+    /// server_config.protocols(&[quinn_h3::ALPN, b"teapotmq"]);
+    ///
+    /// let mut quic_builder = quinn::Endpoint::builder();
+    /// quic_builder.listen(server_config.build());
+    ///
+    /// let (_, mut incoming) =
+    ///     quic_builder.bind(&"[::]:4433".parse().unwrap()).unwrap();
+    ///
+    /// while let Some(connecting) = incoming.next().await {
+    ///     match &connecting.authentication_data().protocol.unwrap()[..] {
+    ///         b"teapotmq" => serve_tea(connecting).await,
+    ///         quinn_h3::ALPN => {
+    ///             let connecting =
+    ///                 quinn_h3::server::Connecting::from_quic(connecting, Settings::default());
+    ///             serve_h3(connecting).await;
+    ///         }
+    ///         _ => (),
+    ///     }
+    /// }
+    /// # });
+    /// # }
+    /// ```
+    ///
+    /// [`quinn_h3::ALPN`]: ../constant.ALPN.html
+    /// [`Connecting::from_quic()`]: #method.from_quic
+    /// [`From<quinn::Connecting>`]: #method.from
     pub fn from_quic(connecting: quinn::Connecting, settings: Settings) -> Self {
         Self {
             connecting,
@@ -197,9 +485,37 @@ impl From<quinn::Connecting> for Connecting {
     }
 }
 
+/// Stream of incoming requests for a connection.
+///
+/// This yeilds [`RecvRequest`] futures as soon as its underlying QUIC stream is open.
+///
+/// ```
+/// use futures::StreamExt;
+/// use quinn_h3::{
+///     server::{Connecting, IncomingRequest},
+///     Error,
+/// };
+///
+/// async fn handle_connection(connecting: Connecting) -> Result<(), Error> {
+///     let mut incoming_request = connecting.await?;
+///
+///     while let Some(recv_request) = incoming_request.next().await {
+///         let (request, _, _) = recv_request.await?;
+///         println!("Received request: {:?}", request);
+///     }
+///
+///     Ok(())
+/// }
+/// ```
+///
+/// [`RecvRequest`]: struct.RecvRequest.html
 pub struct IncomingRequest(ConnectionRef);
 
 impl IncomingRequest {
+    /// Gracefully shutdown the connection.
+    ///
+    /// All currently running connection will be honored, as well as those sent before the
+    /// client receieved the GoAway frame.
     pub fn go_away(&mut self) {
         self.0.h3.lock().unwrap().inner.go_away();
     }
@@ -217,6 +533,43 @@ impl Stream for IncomingRequest {
     }
 }
 
+/// Receive request's headers future.
+///
+/// Will resolve once headers have been received and decoded, returning a tuple with the
+/// actual [`Request`], a [`BodyReader`] and a [`Sender`] that enables sending back a response.
+///
+/// At this time, you are free to do what's appropriate according to the content of the header.
+/// Including sending a response, obviously, but also streaming the request's body and send back
+/// a response and its body concurrently. Or the request can also be [`rejected`].
+///
+/// ```
+/// use anyhow::Result;
+/// use futures::{AsyncReadExt};
+/// use http::{Method, Request, Response, StatusCode};
+///
+/// use quinn_h3::server::RecvRequest;
+///
+/// async fn handle_resquest(recv_request: RecvRequest) -> Result<()> {
+///     let (request, mut body_reader, mut sender) = recv_request.await?;
+///     println!("received request: {:?}", request);
+///
+///     if request.method() == Method::POST {
+///         let mut body = String::new();
+///         body_reader.read_to_string(&mut body);
+///         println!("received body: {}", body);
+///     }
+///
+///     let response = Response::builder().status(StatusCode::OK).body(())?;
+///     sender.send_response(response).await?;
+///
+///     Ok(())
+/// }
+/// ```
+///
+/// [`Request`]: https://docs.rs/http/*/http/request/struct.Request.html
+/// [`BodyReader`]: ../body/struct.BodyReader.html
+/// [`Sender`]: ../struct.Sender.html
+/// [`rejected`]: #method.reject
 pub struct RecvRequest {
     state: RecvRequestState,
     conn: ConnectionRef,
@@ -232,6 +585,7 @@ enum RecvRequestState {
 }
 
 impl RecvRequest {
+    /// Reject this request with `REQUEST_REJECTED` code.
     pub fn reject(mut self) {
         let state = mem::replace(&mut self.state, RecvRequestState::Finished);
         if let RecvRequestState::Receiving(recv, mut send) = state {
@@ -336,6 +690,21 @@ impl Future for RecvRequest {
     }
 }
 
+/// Send a response back to the client.
+///
+/// This struct is made available once request headers are received, when [`RecvRequest`] resolves.
+/// The application can then send the resulting [`http::Response`] with [`send_response()`]. It can
+/// be used independently with [`BodyReader`], so you can choose whether the application needs to
+/// receive the body prior to issuing a response or if a response can be issued right away.
+///
+/// The request can also be cancelled with [`cancel()`], after which the client will receive a request
+/// error with `REQUEST_REJECTED` cause.
+///
+/// [`RecvRequest`]: struct.RecvRequest.html
+/// [`http::Response`]: https://docs.rs/http/*/http/response/struct.Response.html
+/// [`send_response()`]: #method.Response
+/// [`BodyReader`]: ../body/struct.BodyReader.html
+/// [`cancel()`]: #method.cancel
 pub struct Sender {
     send: SendStream,
     conn: ConnectionRef,
@@ -343,6 +712,62 @@ pub struct Sender {
 }
 
 impl Sender {
+    /// Start sending a response.
+    ///
+    /// Use this with an [`http::Response<B>`], where B parameter type lets you choose how the body
+    /// should be transmitted:
+    ///
+    /// - `T: Into<Body>`: when data is convertible to [`Body`], which includes simple types
+    ///    such as `&str` or `&[u8]`.
+    /// - `()`: when there won't be any body transmitted, or it will be streamed via [`BodyWriter`].
+    ///
+    /// Note that both methods can be combined toghether if applicable.
+    ///
+    /// # Example: simple body
+    ///
+    /// ```
+    /// use anyhow::Result;
+    /// use http::{Response, StatusCode};
+    /// use quinn_h3::server::Sender;
+    ///
+    /// async fn simple_response(sender: Sender) -> Result<()> {
+    ///    let response = Response::builder()
+    ///        .status(StatusCode::OK)
+    ///        .body("the response body")?;
+    ///
+    ///    sender.send_response(response).await?;
+    ///
+    ///    Ok(())
+    /// }
+    /// ```
+    ///
+    /// # Example: streamed body
+    ///
+    /// Use [`BodyWriter`]'s [`AsyncWrite`] impl to stream the body from a file:
+    ///
+    /// ```
+    /// use anyhow::Result;
+    /// use http::{Response, StatusCode};
+    /// use quinn_h3::server::Sender;
+    ///
+    /// async fn stramed_response(sender: Sender) -> Result<()> {
+    ///    let response = Response::builder()
+    ///        .status(StatusCode::OK)
+    ///        .body(())?;
+    ///
+    ///    let mut body = sender.send_response(response).await?;
+    ///
+    ///    let mut file = tokio::fs::File::open("foo.txt").await?;
+    ///    tokio::io::copy(&mut file, &mut body).await?;
+    ///
+    ///    Ok(())
+    /// }
+    /// ```
+    ///
+    /// [`http::Response<B>`]: https://docs.rs/http/*/http/response/struct.Response.html
+    /// [`Body`]: ../enum.Body.html
+    /// [`BodyWriter`]: ../struct.BodyWriter.html
+    /// [`AsyncWrite`]: https://docs.rs/futures/*/futures/io/trait.AsyncWrite.html
     pub async fn send_response<T: Into<Body>>(
         self,
         response: Response<T>,
@@ -366,6 +791,10 @@ impl Sender {
         Ok(BodyWriter::new(send, self.conn, self.stream_id, true))
     }
 
+    /// Terminate the request by rejecting it.
+    ///
+    /// Sends a request error with `REQUEST_REJECTED` HTTP/3 error code. Once called, all ohter
+    /// calls on any object related to this request will fail.
     pub fn cancel(mut self) {
         self.send.reset(ErrorCode::REQUEST_REJECTED.into());
     }
