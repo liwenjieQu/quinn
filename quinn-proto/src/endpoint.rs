@@ -111,8 +111,10 @@ where
     ) -> Option<ConnectionEvent> {
         use EndpointEventInner::*;
         match event.0 {
-            NeedIdentifiers(n) => {
-                return Some(self.send_new_identifiers(ch, n));
+            NeedIdentifiers(now, n) => {
+                if self.connections.get(ch.into()).is_some() {
+                    return Some(self.send_new_identifiers(now, ch, n));
+                }
             }
             ResetToken(remote, token) => {
                 if let Some(old) = self.connections[ch].reset_token.replace((remote, token)) {
@@ -122,11 +124,13 @@ where
                     warn!("duplicate reset token");
                 }
             }
-            RetireConnectionId(seq) => {
+            RetireConnectionId(now, seq, allow_more_cid) => {
                 if let Some(cid) = self.connections[ch].loc_cids.remove(&seq) {
                     trace!("peer retired CID {}: {}", seq, cid);
                     self.connection_ids.remove(&cid);
-                    return Some(self.send_new_identifiers(ch, 1));
+                    if allow_more_cid {
+                        return Some(self.send_new_identifiers(now, ch, 1));
+                    }
                 }
             }
             Drained => {
@@ -345,7 +349,7 @@ where
         if self.is_full() {
             return Err(ConnectError::TooManyConnections);
         }
-        let remote_id = RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid();
+        let (remote_id, _) = RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid();
         trace!(initial_dcid = %remote_id);
         let (ch, conn) = self.add_connection(
             remote_id,
@@ -360,10 +364,15 @@ where
         Ok((ch, conn))
     }
 
-    fn send_new_identifiers(&mut self, ch: ConnectionHandle, num: u64) -> ConnectionEvent {
+    fn send_new_identifiers(
+        &mut self,
+        now: Instant,
+        ch: ConnectionHandle,
+        num: u64,
+    ) -> ConnectionEvent {
         let mut ids = vec![];
         for _ in 0..num {
-            let id = self.new_cid();
+            let (id, _) = self.new_cid();
             self.connection_ids.insert(id, ch);
             let meta = &mut self.connections[ch];
             meta.cids_issued += 1;
@@ -375,14 +384,14 @@ where
                 reset_token: ResetToken::new(&*self.config.reset_key, &id),
             });
         }
-        ConnectionEvent(ConnectionEventInner::NewIdentifiers(ids))
+        ConnectionEvent(ConnectionEventInner::NewIdentifiers(ids, now))
     }
 
-    fn new_cid(&mut self) -> ConnectionId {
+    fn new_cid(&mut self) -> (ConnectionId, Option<Duration>) {
         loop {
-            let cid = self.local_cid_generator.generate_cid();
+            let (cid, lifetime) = self.local_cid_generator.generate_cid();
             if !self.connection_ids.contains_key(&cid) {
-                break cid;
+                break (cid, lifetime);
             }
             assert!(self.local_cid_generator.cid_len() > 0);
         }
@@ -396,7 +405,7 @@ where
         opts: ConnectionOpts<S>,
         now: Instant,
     ) -> Result<(ConnectionHandle, Connection<S>), ConnectError> {
-        let loc_cid = self.new_cid();
+        let (loc_cid, cid_timeout) = self.new_cid();
         let (server_config, tls, transport_config) = match opts {
             ConnectionOpts::Client {
                 config,
@@ -450,6 +459,7 @@ where
             remote,
             tls,
             now,
+            cid_timeout,
             self.local_cid_generator.cid_len(),
         );
         let id = self.connections.insert(ConnectionMeta {
@@ -509,7 +519,7 @@ where
         }
 
         // Local CID used for stateless packets
-        let temp_loc_cid = self.new_cid();
+        let (temp_loc_cid, _) = self.new_cid();
         let server_config = self.server_config.as_ref().unwrap();
 
         if self.incoming_handshakes == server_config.accept_buffer as usize

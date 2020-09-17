@@ -14,23 +14,26 @@ pub(crate) enum Timer {
     PathValidation = 4,
     /// When to send a `PING` frame to keep the connection alive
     KeepAlive = 5,
+    /// When to invalidate old CID and proactively push new one via NEW_CONNECTION_ID frame
+    PushNewCid = 6,
 }
 
 impl Timer {
-    pub(crate) const VALUES: [Self; 6] = [
+    pub(crate) const VALUES: [Self; 7] = [
         Timer::LossDetection,
         Timer::Idle,
         Timer::Close,
         Timer::KeyDiscard,
         Timer::PathValidation,
         Timer::KeepAlive,
+        Timer::PushNewCid,
     ];
 }
 
 /// A table of data associated with each distinct kind of `Timer`
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct TimerTable {
-    data: [Option<Instant>; 6],
+    data: [Option<Instant>; 7],
 }
 
 impl TimerTable {
