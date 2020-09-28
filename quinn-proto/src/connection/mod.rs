@@ -3062,8 +3062,8 @@ where
     #[cfg(test)]
     pub(crate) fn active_local_cid_seq(&self) -> (u64, u64) {
         (
-            self.cids_active_seq.iter().min().unwrap().clone(),
-            self.cids_active_seq.iter().max().unwrap().clone(),
+            *self.cids_active_seq.iter().min().unwrap(),
+            *self.cids_active_seq.iter().max().unwrap(),
         )
     }
 
